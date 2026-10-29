@@ -1,92 +1,58 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
-    [string]$DotNetPath,
+    [ValidateSet('Release','Debug')][string]$Configuration='Release',
+    [string]$BuildDirectory='artifacts/native/ninja',
+    [string]$VisualStudioPath,
+    [switch]$Asan,
     [switch]$SkipTests,
-    [switch]$SkipNative,
-    [switch]$NoRestore
+    [switch]$NoGui,
+    [int]$Jobs=8
 )
-$ErrorActionPreference = 'Stop'
-$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if (-not $DotNetPath) {
-    $bundledSdk = Join-Path $repoRoot '.tools/dotnet/dotnet.exe'
-    if (Test-Path -LiteralPath $bundledSdk) { $DotNetPath = $bundledSdk }
-    else { $DotNetPath = (Get-Command dotnet -ErrorAction Stop).Source }
+$ErrorActionPreference='Stop'
+$root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$build=[IO.Path]::GetFullPath((Join-Path $root $BuildDirectory))
+$toolRoot=Join-Path $root '.tools'
+New-Item -ItemType Directory -Force $toolRoot | Out-Null
+function Get-PinnedZip([string]$Url,[string]$Hash,[string]$Archive,[string]$Destination) {
+    if(-not(Test-Path -LiteralPath $Archive)){Invoke-WebRequest -Uri $Url -OutFile $Archive}
+    if((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ne $Hash){throw "Checksum mismatch: $Archive"}
+    Expand-Archive -LiteralPath $Archive -DestinationPath $Destination -Force
 }
-$env:DOTNET_CLI_HOME = Join-Path $repoRoot '.tools/cli'
-$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
-$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
-$env:DOTNET_NOLOGO = '1'
-function Invoke-DotNet([string[]]$Arguments) {
-    & $DotNetPath @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "dotnet $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
+$cmake=Join-Path $toolRoot 'cmake-3.31.6-windows-x86_64/bin/cmake.exe'
+if(-not(Test-Path -LiteralPath $cmake)) {
+    Get-PinnedZip 'https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip' 'D163CD3AB4959B0A53FA8988F2DDBD2E6C501658201E6A154386BAD9DBE4F836' (Join-Path $toolRoot 'cmake-3.31.6.zip') $toolRoot
 }
-Push-Location $repoRoot
-try {
-    $projects = @('src/Polar.Core/Polar.Core.csproj', 'src/Polar.Windows/Polar.Windows.csproj', 'samples/Polar.Console/Polar.Console.csproj')
-    if (-not $SkipTests) {
-        $projects += 'tests/Polar.Tests/Polar.Tests.csproj'
-        $projects += 'src/Polar.Windows/Verification/Polar.Windows.Verification.csproj'
-        $projects += 'src/Polar.Windows/Verification/UnityAdapter/UnityAdapter.Compile.csproj'
-    }
-    if (-not $SkipNative) { $projects += 'src/Polar.Native/Polar.Native.csproj' }
-    if (-not $NoRestore) { foreach ($project in $projects) { Invoke-DotNet -Arguments @('restore', $project) } }
-    Invoke-DotNet -Arguments @('build', 'src/Polar.Windows/Polar.Windows.csproj', '-c', $Configuration, '--no-restore')
-    Invoke-DotNet -Arguments @('build', 'samples/Polar.Console/Polar.Console.csproj', '-c', $Configuration, '--no-restore')
-    if (-not $SkipTests) {
-        Invoke-DotNet -Arguments @('run', '--project', 'tests/Polar.Tests/Polar.Tests.csproj', '-c', $Configuration, '--no-restore')
-        Invoke-DotNet -Arguments @('run', '--project', 'src/Polar.Windows/Verification/Polar.Windows.Verification.csproj', '-c', $Configuration, '--no-restore')
-        Invoke-DotNet -Arguments @('build', 'src/Polar.Windows/Verification/UnityAdapter/UnityAdapter.Compile.csproj', '-c', $Configuration, '--no-restore')
-    }
-    if (-not $SkipNative) {
-        Invoke-DotNet -Arguments @('publish', 'src/Polar.Native/Polar.Native.csproj', '-c', $Configuration, '--no-restore')
-    }
-    $managedTarget = Join-Path $repoRoot 'unity/com.polarble.sdk/Runtime/Plugins/Managed'
-    $nativeTarget = Join-Path $repoRoot 'unity/com.polarble.sdk/Runtime/Plugins/x86_64'
-    New-Item -ItemType Directory -Path $managedTarget, $nativeTarget -Force | Out-Null
-    $copyFiles = @{
-        (Join-Path $repoRoot "src/Polar.Core/bin/$Configuration/netstandard2.1/Polar.Core.dll") = (Join-Path $managedTarget 'Polar.Core.dll')
-    }
-    # Resolve exact restored runtime assets from project.assets.json rather than assuming
-    # a package-cache path or silently copying a different NuGet version.
-    $assets = Get-Content -LiteralPath (Join-Path $repoRoot 'src/Polar.Core/obj/project.assets.json') -Raw | ConvertFrom-Json
-    $packageFolders = @($assets.packageFolders.PSObject.Properties.Name)
-    foreach ($spec in @(
-        @{ Name = 'Google.Protobuf'; File = 'lib/netstandard2.0/Google.Protobuf.dll' },
-        @{ Name = 'System.Runtime.CompilerServices.Unsafe'; File = 'lib/netstandard2.0/System.Runtime.CompilerServices.Unsafe.dll' }
-    )) {
-        $library = @($assets.libraries.PSObject.Properties | Where-Object { $_.Name.StartsWith($spec.Name + '/', [StringComparison]::OrdinalIgnoreCase) })
-        if ($library.Count -ne 1) { throw "Expected one restored package for $($spec.Name)." }
-        $source = $null
-        foreach ($folder in $packageFolders) {
-            $candidate = Join-Path (Join-Path $folder $library[0].Value.path) $spec.File
-            if (Test-Path -LiteralPath $candidate) { $source = $candidate; break }
-        }
-        if (-not $source) { throw "Restored runtime asset missing: $($spec.Name)/$($spec.File)" }
-        $copyFiles[$source] = Join-Path $managedTarget ([IO.Path]::GetFileName($spec.File))
-    }
-    if (-not $SkipNative) {
-        # Only publish/ contains the native DLL; bin/<configuration>/ contains managed IL.
-        $nativeSource = Join-Path $repoRoot "src/Polar.Native/bin/$Configuration/net10.0-windows10.0.19041.0/win-x64/publish/Polar.Native.dll"
-        $copyFiles[$nativeSource] = Join-Path $nativeTarget 'Polar.Native.dll'
-        $verificationOutput = Join-Path $repoRoot "src/Polar.Windows/Verification/bin/$Configuration/net10.0-windows10.0.19041.0"
-        if (Test-Path -LiteralPath $verificationOutput) {
-            Copy-Item -LiteralPath $nativeSource -Destination (Join-Path $verificationOutput 'Polar.Native.dll') -Force
-        }
-    }
-    foreach ($entry in $copyFiles.GetEnumerator()) {
-        if (-not (Test-Path -LiteralPath $entry.Key)) { throw "Build output missing: $($entry.Key)" }
-        Copy-Item -LiteralPath $entry.Key -Destination $entry.Value -Force
-    }
-    $manifest = foreach ($entry in $copyFiles.GetEnumerator()) {
-        $file = Get-Item -LiteralPath $entry.Value
-        [ordered]@{ file = $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/'); bytes = $file.Length; sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash }
-    }
-    $evidence = Join-Path $repoRoot 'artifacts/build'
-    New-Item -ItemType Directory -Path $evidence -Force | Out-Null
-    [ordered]@{ generatedUtc = [DateTime]::UtcNow.ToString('O'); configuration = $Configuration; nativePublished = -not $SkipNative; files = @($manifest) } |
-        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'package-manifest.json') -Encoding utf8
-    Write-Host "Unity package refreshed: $(Join-Path $repoRoot 'unity/com.polarble.sdk')"
-    if ($SkipNative) { Write-Warning 'Native publish was skipped; an existing native DLL was not refreshed.' }
+$ninja=Join-Path $toolRoot 'ninja/ninja.exe'
+if(-not(Test-Path -LiteralPath $ninja)) {
+    Get-PinnedZip 'https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip' 'F550FEC705B6D6FF58F2DB3C374C2277A37691678D6ABA463ADCBB129108467A' (Join-Path $toolRoot 'ninja-1.12.1.zip') (Join-Path $toolRoot 'ninja')
 }
-finally { Pop-Location }
+if(-not $VisualStudioPath) {
+    $local=Join-Path $toolRoot 'BuildTools'
+    if(Test-Path -LiteralPath (Join-Path $local 'VC/Auxiliary/Build/vcvars64.bat')){$VisualStudioPath=$local}
+    else {
+        $vswhere=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+        if(Test-Path -LiteralPath $vswhere){$VisualStudioPath=& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath}
+    }
+}
+if(-not $VisualStudioPath){throw 'Install VS 2022 Build Tools with Desktop development with C++, Windows SDK >= 10.0.19041 and optional AddressSanitizer.'}
+$vcvars=Join-Path $VisualStudioPath 'VC/Auxiliary/Build/vcvars64.bat'
+if($vcvars.Contains('"')){throw 'Invalid Visual Studio path'}
+# Import the toolchain environment once; build arguments stay an argument array.
+$environment=& cmd /d /s /c "`"$vcvars`" >nul && set"
+if($LASTEXITCODE -ne 0){throw 'vcvars64 failed'}
+foreach($line in $environment){if($line -match '^([^=]+)=(.*)$'){[Environment]::SetEnvironmentVariable($matches[1],$matches[2],'Process')}}
+$compiler=(Get-Command cl.exe -ErrorAction Stop).Source
+if(-not(Test-Path -LiteralPath (Join-Path (Split-Path $compiler) '1033/clui.dll'))){throw 'Install the English language pack for Visual Studio Build Tools (en-US); Ninja header dependency tracking uses English /showIncludes output.'}
+if($Asan){$env:ASAN_OPTIONS='halt_on_error=1:alloc_dealloc_mismatch=1'}
+$asanValue=if($Asan){'ON'}else{'OFF'}
+$guiValue=if($NoGui){'OFF'}else{'ON'}
+& $cmake -S $root -B $build -G Ninja "-DCMAKE_BUILD_TYPE=$Configuration" "-DCMAKE_MAKE_PROGRAM=$ninja" "-DPOLAR_ASAN=$asanValue" "-DPOLAR_GUI=$guiValue"
+if($LASTEXITCODE -ne 0){throw 'CMake configure failed'}
+& $cmake --build $build --parallel $Jobs
+if($LASTEXITCODE -ne 0){throw 'CMake build failed'}
+if(-not $SkipTests) {
+    Push-Location $root
+    try {& (Join-Path (Split-Path $cmake) 'ctest.exe') --test-dir $build --output-on-failure;if($LASTEXITCODE -ne 0){throw 'Native tests failed'}}
+    finally {Pop-Location}
+}
+Write-Host "Native SDK build: $build"

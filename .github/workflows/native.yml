@@ -1,0 +1,32 @@
+name: Native Windows SDK
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Compile native SDK and tests
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: Prepare Unity package contents
+        shell: pwsh
+        run: ./scripts/prepare-native-unity.ps1
+      - name: Package preview artifacts
+        shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: polar-native-windows-preview
+          path: |
+            artifacts/packages/*.zip
+            artifacts/packages/*.tgz
+            artifacts/packages/SHA256SUMS.txt
+      - name: ASan core and lifetime checks
+        shell: pwsh
+        run: ./scripts/build.ps1 -Asan -NoGui -BuildDirectory artifacts/native/asan

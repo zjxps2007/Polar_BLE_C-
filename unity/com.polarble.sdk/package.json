@@ -1,9 +1,10 @@
 {
   "name": "com.polarble.sdk",
-  "version": "0.1.0",
-  "displayName": "Polar BLE C# Windows Port (Experimental)",
-  "description": "Unofficial C# port of Polar BLE protocols for Windows and Unity. See implementation status and the Polar SDK license.",
-  "unity": "6000.0",
+  "version": "0.2.0-preview.1",
+  "displayName": "Polar Native SDK (Windows Preview)",
+  "description": "C++20 Polar BLE core, ABI v2, persistent batch buffers for Unity 6. See native migration and hardware verification status.",
+  "unity": "6000.3",
+  "dependencies": { "com.unity.collections": "2.6.3" },
   "author": { "name": "Local development" },
-  "samples": [{ "displayName": "Heart Rate", "description": "Windows BLE scan/connect and main-thread heart rate events.", "path": "Samples~/HeartRate" }]
+  "samples": [{ "displayName": "Live Sensor", "description": "Native ACC batching, graph and object orientation. Replay enabled by default.", "path": "Samples~/LiveSensor" }]
 }

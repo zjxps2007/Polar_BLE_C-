@@ -1,0 +1,3 @@
+#pragma once
+// Polar SDK capability snapshot; see NOTICE and LICENSES/Polar_SDK_License.txt.
+inline constexpr const char polar_capability_config[] = R"POLAR(@POLAR_CAPABILITIES_JSON@)POLAR";

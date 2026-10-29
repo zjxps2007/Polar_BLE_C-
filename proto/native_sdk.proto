@@ -1,0 +1,68 @@
+syntax = "proto2";
+package polar.sdk;
+// Native ABI control payloads. Sensor samples use fixed C structures instead.
+message ServiceRequest {
+ optional string path=1;
+ optional string from_day=2;
+ optional string to_day=3;
+ optional bytes payload=4;
+ optional string schema=5;
+ optional uint64 value=6;
+ repeated uint32 values=7;
+ optional uint32 flags=8;
+ optional string client_id=9;
+ optional string device_id=10;
+ optional bytes package=11;
+ optional string backup_path=12;
+ optional int64 unix_time_ms=13;
+ optional sint32 timezone_minutes=14;
+ optional bytes key=15;
+ optional uint32 key_strategy=16;
+ repeated PmdSetting pmd_settings=17;
+ optional bool enabled=18;
+ optional bool offline=19;
+ repeated PmdTrigger triggers=20;
+}
+message PmdSetting {required uint32 type=1; repeated fixed32 values=2;}
+message PmdTrigger {required uint32 measurement=1;required bool enabled=2;repeated PmdSetting settings=3;}
+message PmdStatus {required uint32 measurement=1;required uint32 state=2;}
+message PmdResponse {required bytes wire=1;repeated PmdSetting settings=2;repeated PmdTrigger triggers=3;optional uint32 trigger_mode=4;optional bool sdk_mode=5;repeated PmdStatus statuses=6;}
+message StoredFile {
+ required string path=1;
+ optional uint64 size=2;
+ optional bytes data=3;
+ optional string schema=4;
+ optional bytes source_data=5; // Original compressed bytes, only when data was decompressed.
+}
+message ServiceResult {
+ repeated StoredFile files=1;
+ optional bytes data=2;
+ optional string schema=3;
+ optional uint64 unsigned_value=4;
+ optional double real_value=5;
+ optional bool boolean_value=6;
+ optional string text=7;
+ repeated uint64 unsigned_values=8;
+ repeated double real_values=9;
+}
+message PpiSample { required int32 interval_ms=1; required int32 error_ms=2; required uint32 status=3; }
+message PpiSession {
+ required string day=1;
+ required bytes source=2; // Original PbPpIntervalAutoSamples preserves optional/unknown trigger/time.
+ repeated PpiSample samples=3;
+}
+message PpiSessions { repeated PpiSession sessions=1; }
+message RestEvent { required bytes json=1; optional uint32 sleep_status=2; } // 0 unknown, 1 disabled, 2 enabled.
+message RestEvents { repeated RestEvent events=1; }
+message FirmwareInfo {required bool update_available=1;optional string version=2;optional string file_url=3;optional bool mandatory=4;optional bytes catalog_json=5;}
+message DeviceAttribute {required bytes uuid=1;required bytes value=2;optional bool binary=3;}
+// Feature IDs follow the public native enum; states: 0 unknown, 1 ready, 2 unavailable, 3 failed.
+message FeatureReadiness {required uint32 feature=1;required uint32 state=2;optional sint32 result=3;optional sint32 hresult=4;optional uint32 att_error=5;}
+message DeviceSnapshot {
+ required uint64 address=1;optional string name=2;
+ repeated bytes services=3;repeated DeviceAttribute attributes=4;
+ repeated FeatureReadiness features=5;repeated uint32 hr_measurements=6;
+ optional bytes pmd_features=7;optional bytes pfcs_features=8;
+}
+message OfflineRecordingGroup {required string path=1;required string measurement=2;required uint64 size=3;repeated StoredFile parts=4;}
+message OfflineRecordingGroups {repeated OfflineRecordingGroup recordings=1;}

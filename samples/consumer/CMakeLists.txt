@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.28)
+project(PolarConsumer LANGUAGES CXX)
+find_package(PolarNative CONFIG REQUIRED)
+add_executable(polar_consumer main.cpp)
+target_compile_features(polar_consumer PRIVATE cxx_std_20)
+target_link_libraries(polar_consumer PRIVATE Polar::SDK)
+add_custom_command(TARGET polar_consumer POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:Polar::SDK> $<TARGET_FILE_DIR:polar_consumer>)

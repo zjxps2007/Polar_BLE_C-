@@ -1,5 +1,0 @@
-<linker>
-  <assembly fullname="Polar.Core" preserve="all" />
-  <assembly fullname="Google.Protobuf" preserve="all" />
-  <assembly fullname="PolarBle.Unity" preserve="all" />
-</linker>

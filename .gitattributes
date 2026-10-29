@@ -5,6 +5,7 @@
 # Preserve upstream notices and Unity-generated metadata without whitespace edits.
 LICENSES/** -whitespace
 proto/** -whitespace
+unity/com.polarble.sdk/Schemas~/** -whitespace
 unity/com.polarble.sdk/Licenses~/** -whitespace
 unity/com.polarble.sdk/LICENSE.md -whitespace
 *.meta -whitespace

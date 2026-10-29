@@ -1,10 +1,8 @@
 {
-  "name": "PolarBle.Unity",
-  "rootNamespace": "PolarBle.Unity",
-  "includePlatforms": [
-    "Editor",
-    "WindowsStandalone64"
-  ],
-  "allowUnsafeCode": false,
-  "autoReferenced": true
+ "name":"PolarBle.Unity",
+ "rootNamespace":"Polar.Native",
+ "references":["Unity.Collections"],
+ "includePlatforms":["Editor","WindowsStandalone64"],
+ "allowUnsafeCode":true,
+ "autoReferenced":true
 }
