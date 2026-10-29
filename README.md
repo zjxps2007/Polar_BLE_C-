@@ -2,7 +2,7 @@
 
 C++20 코어와 C ABI v2를 사용하는 **0.2.0-preview**입니다. Windows SDK·GUI에는 .NET 런타임이 필요하지 않습니다. C# 코드는 Unity 바인딩·샘플·검증에만 사용합니다. 이전 C# API와 호환되지 않습니다.
 
-**개발용 미리보기입니다.** 네이티브 재생·모의 프로토콜 시험과 실제 센서 지원은 별개입니다. Verity Sense 3.0.16은 Windows GATT 서비스 검색에서 `Unreachable`이 발생하여 HR·ACC 실기 사용 가능으로 표시하지 않습니다. [구현 상태](docs/PORTING-STATUS.md), [검증 결과](docs/VERIFICATION.md)를 확인하세요.
+**개발용 미리보기입니다.** 연결·초기화·인증 흐름을 수정한 동일 DLL로 Verity Sense 3.0.16의 HR을 Windows C++·Unity IL2CPP에서 각각 60초간 62건 수신했습니다. 다만 Mono 연결 종료와 ACC 인증 부족(ATT 0x05)이 남아 있어 안정적인 HR·ACC 실기 지원 완료로 표시하지 않습니다. [구현 상태](docs/PORTING-STATUS.md), [검증 결과](docs/VERIFICATION.md)를 확인하세요.
 
 | 산출물 | 내용 |
 |---|---|
@@ -14,7 +14,7 @@ C++20 코어와 C ABI v2를 사용하는 **0.2.0-preview**입니다. Windows SDK
 
 ## 빌드
 
-VS 2022 Build Tools의 C++ x64 도구, Windows SDK 10.0.19041 이상과 영문 컴파일러 리소스가 필요합니다. CMake 3.31.6·Ninja 1.12.1은 스크립트가 해시를 확인해 준비합니다. 최초 의존성 다운로드에는 네트워크가 필요합니다. `.tools/BuildTools`가 있으면 사용하며, 없으면 `vswhere`로 찾습니다.
+VS 2022 Build Tools의 C++ x64 도구, Windows SDK 10.0.22000 이상과 영문 컴파일러 리소스가 필요합니다. CMake 3.31.6·Ninja 1.12.1은 스크립트가 해시를 확인해 준비합니다. 최초 의존성 다운로드에는 네트워크가 필요합니다. `.tools/BuildTools`가 있으면 사용하며, 없으면 `vswhere`로 찾습니다.
 
 ```powershell
 ./scripts/build.ps1
@@ -51,12 +51,16 @@ auto request = sdk.scan();
 
 주소는 검색 결과의 12자리 BLE 주소를 사용합니다. GUI의 `Replay ACC`는 센서 없이 동일한 수신 경로와 CSV를 시험합니다. 실제 기기 기능은 지원 설정과 기능 조회 결과에 따릅니다. 삭제·초기화·펌웨어 변경은 명시적으로 해당 명령을 제출할 때만 수행됩니다.
 
+Windows 설정에서 미리 페어링할 필요는 없습니다. GUI에서 검색한 센서를 선택하면 같은 네이티브 코어가 연결·협상·HR/DIS/배터리 초기화를 완료한 뒤 `Ready`를 표시합니다. ACC 시작 시 필요한 PMD 초기화와 인증도 코어에서 수행합니다. 기존 키 오류가 확인된 경우에만 `Reset Windows pairing`으로 선택한 센서의 Windows 등록을 해제한 뒤 다시 연결하세요. [연결·인증 구현과 실기 결과](docs/CONNECTION-FLOW.md)를 참조하세요.
+
 ## Unity
 
 1. `prepare-native-unity.ps1`로 현재 DLL을 UPM에 복사합니다.
 2. Package Manager의 **Add package from disk**로 `unity/com.polarble.sdk/package.json`을 선택하거나 배포 TGZ를 설치합니다.
 3. **Live Sensor** 샘플을 가져와 `PolarSensorView`를 GameObject에 추가합니다.
 4. Windows x64를 선택합니다. IL2CPP는 Editor의 Windows IL2CPP 모듈과 C++ 도구가 필요합니다.
+
+실제 센서는 샘플의 `Replay=false`, `BluetoothAddress=검색한 주소`로 설정합니다. `PolarContext.Connect(address, true, ConnectionFeatures.Default | ConnectionFeatures.Streaming)`은 PMD까지 준비한 뒤 완료 이벤트를 보냅니다. `TryGetConnectionState`로 인증 대기·기능 준비 상태를 표시할 수 있습니다. Windows 예제와 동일한 `polar_sdk.dll`이 모든 BLE 처리를 담당합니다.
 
 `PolarContext`는 EarlyUpdate에서 스트림별 Persistent `NativeArray<Sample>`에 데이터를 읽습니다. `stream.Count` 범위만 같은 프레임에 소비하세요. 다음 프레임에 내용이 바뀝니다. 샘플마다 이벤트·객체·문자열을 생성하지 않습니다. 제어 이벤트는 메인 스레드에서 전달되며 앱의 이벤트 처리 비용도 측정 범위에 들어갈 수 있습니다.
 

@@ -98,6 +98,8 @@ inline void DrawPolarPanel() {
         polar::sdk::context ctx{POLAR_LOSSLESS, 8192};
         std::map<uint64_t, polar_advertisement> devices;
         polar_device device = 0;
+        uint64_t selected_address = 0;
+        polar_connection_state connection{};
         polar_stream stream = 0;
         std::set<polar_stream> streams;
         std::map<polar_stream, polar_device> stream_devices;
@@ -141,6 +143,18 @@ inline void DrawPolarPanel() {
             polar_advertisement a;
             std::memcpy(&a, s.payload.data(), sizeof(a));
             s.devices[a.address] = a;
+        } else if (e.type == POLAR_EVENT_CONNECTION_STATE && n == sizeof(polar_connection_state)) {
+            std::memcpy(&s.connection, s.payload.data(), sizeof(s.connection));
+            const char *names[] = {"Idle",
+                                   "Connecting",
+                                   "Discovering services",
+                                   "Negotiating link",
+                                   "Initializing features",
+                                   "Authenticating",
+                                   "Ready",
+                                   "Failed"};
+            auto phase = s.connection.state;
+            log(std::string("Connection: ") + (phase < 8 ? names[phase] : "Unknown"));
         } else {
             char text[256];
             std::snprintf(
@@ -165,8 +179,9 @@ inline void DrawPolarPanel() {
                     s.streams.insert(e.stream);
                     s.stream_devices[e.stream] = e.device;
                 }
-                if (operation == POLAR_OP_DISCONNECT) {
+                if (operation == POLAR_OP_DISCONNECT || operation == POLAR_OP_UNPAIR) {
                     s.device = 0;
+                    s.connection = {};
                 }
                 if (n) {
                     s.settings.clear();
@@ -280,6 +295,7 @@ inline void DrawPolarPanel() {
         char name[192];
         std::snprintf(name, sizeof(name), "%s | %012llX | %d dBm", a.name, address, a.rssi);
         if (ImGui::Selectable(name)) {
+            s.selected_address = address;
             polar_command c{};
             c.operation = POLAR_OP_CONNECT;
             c.address = address;
@@ -289,7 +305,31 @@ inline void DrawPolarPanel() {
         ImGui::PopID();
     }
     ImGui::Separator();
+    ImGui::BeginDisabled(!s.selected_address);
+    if (ImGui::Button("Reset Windows pairing")) {
+        polar_command c{};
+        c.operation = POLAR_OP_UNPAIR;
+        c.address = s.selected_address;
+        action(c);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled(
+        "Use pairing reset after a confirmed stale-key failure, then select the sensor again.");
     ImGui::Text("Device handle: %llu | Stream: %llu | Samples: %llu", s.device, s.stream, s.total);
+    const char *phases[] = {"Idle",
+                            "Connecting",
+                            "Discovering services",
+                            "Negotiating link",
+                            "Initializing features",
+                            "Authenticating",
+                            "Ready",
+                            "Failed"};
+    ImGui::Text("Connection: %s | Ready: 0x%X | Unavailable: 0x%X | Failed: 0x%X",
+                s.connection.state < 8 ? phases[s.connection.state] : "Unknown",
+                s.connection.ready_features, s.connection.unavailable_features,
+                s.connection.failed_features);
+    ImGui::TextDisabled("Select a discovered sensor to connect. Authentication is handled by the "
+                        "SDK when required.");
     ImGui::BeginDisabled(!s.streams.empty());
     if (ImGui::Button("Replay ACC")) {
         polar_command c{};

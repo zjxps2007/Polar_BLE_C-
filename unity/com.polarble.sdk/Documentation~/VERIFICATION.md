@@ -1,6 +1,45 @@
 # Verification record
 
-**Final verification is pending.** On 2026-10-30 the user requested implementation first, verification afterwards. Code added after the candidate below (feature initialization, broadcast batching, typed REST events, offline grouping, preservation fixes and sample changes) has not yet been validated. This file does not certify the current source or binary for production/hardware use.
+**Connection-flow verification updated on 2026-10-30. Full acceptance remains pending.** The connection/initialization/authentication changes have now been compiled and exercised with native tests, ASan and live Verity Sense trials. Results below distinguish successful short HR trials from failed authentication and unstable trials. They do not certify all APIs, sustained collection or production use.
+
+## Current connection-flow candidate
+
+Release DLL SHA-256: `F0EAC0DFEDCCA9928DD32BD68FDFAAA4A7643EA425FA561A0EC53B5735EDC8E5`. This candidate adds a bounded wait for Windows security negotiation to idempotent reads/CCCD operations and refreshes pairing-state snapshots. The native build, UPM, Mono Player and IL2CPP Player use this DLL. Unity is 6000.3.24f1. Device: Verity Sense, firmware **3.0.16 reported by the user**. Times below are KST. Phone apps were closed; the user also power-cycled the sensor before the comparison sequence. Windows bond removal was an explicit diagnostic recovery action, not an automatic CONNECT step.
+
+| Evidence | Observed result | Boundary |
+|---|---|---|
+| MSVC Release | SDK, GUI and diagnostic tools built; CTest 2/2 passed, 3.37 s | Includes connection options, security retry/settlement ordering and bounds, stale/cancel guards, terminal auth error, reconnect options and explicit unpair cancellation |
+| MSVC ASan | CTest 2/2 passed, 3.75 s | 72 golden frames, 20,000 parser mutations, service mocks, lifetime/cancellation tests; assertion count 20,286 is not legacy parity |
+| Unity Mono / IL2CPP builds | Both succeeded, 0 errors / 0 warnings | Managed sources built before the final native-only change; Player DLLs then replaced with the current candidate. Build success does not prove radio reception |
+| Native C++, HR, default mask 7 | **60 seconds / 62 samples**, max receive gap 1.088 s, exit 0 | Trial ended at 04:03:39; one uninterrupted short trial on the current DLL |
+| Unity IL2CPP, HR, default mask 7 | **60 seconds / 62 samples**, max receive gap 1.142 s, success true | Ready preceded CONNECT completion; standalone headless Player, no rendering/performance claim |
+| Unity Mono, HR, default mask 7 | Ready + HR stream start, then disconnect at 22.34 s elapsed / 16.90 s streaming, **0 samples** | Failed trial retained; result -3; no runtime-specific root cause inferred |
+| Native HR+ACC, mask 15, 03:59:32 | HR/DIS/battery prepared (ready mask 7); PMD failed (mask 8), **0 ACC samples** | ATT 0x05, result -13, stage 6; session ended after 17.37 s despite the bounded security wait |
+| Unity Editor HR+ACC, mask 15 | CONNECT failed after 16.70 s, **0 HR / 0 ACC samples** | ATT 0x05, result -13, stage 6; Ready was not emitted |
+
+The address-matched HCI trace of the current native HR+ACC failure shows ATT 0x05 on the protected write and disconnect reason **0x08 (Connection Timeout)** approximately 11.3 seconds later. No successful Encryption Change event appears in that trace. This differs from the earlier stale-key trace below. Waiting longer for security negotiation did not resolve ACC reception.
+
+### Intermediate connection-flow trials
+
+The preceding DLL `0DC4462BB21A372049C737FE25CBA43A0D99CCEF9E993BF9BF198AA92C576971` produced these results before the bounded security-settlement change. They are retained as separate evidence, not current-DLL results:
+
+| Trial | Observed result |
+|---|---|
+| Native HR, mask 1, 03:45:09 | 60 seconds / 60 samples, max gap 1.151 s |
+| Unity IL2CPP HR, mask 1, 03:47:42 | 60 seconds / 60 samples, max gap 1.142 s |
+| Unity Mono HR repeat, mask 1, 03:49:56 | 60 seconds / 61 samples, max gap 1.084 s |
+| Earlier Unity Mono attempts, masks 7 and 1 | 0 samples; disconnected at 16.19 s and 21.86 s elapsed respectively |
+| Native HR+ACC after sensor restart, 03:41:38 | Ready mask 7 / failed mask 8; ATT 0x05, explicit PairAsync status 19 (Failed), result -13, stage 6 |
+| Unity Editor HR+ACC | ATT 0x05, PairAsync status 3 (AlreadyPaired), result -13; no samples |
+| Independent WinRT pairing probe | Refreshed DeviceInformation state; basic PairAsync also returned 19 outside SDK protocol parsing |
+
+Successful native, Mono and IL2CPP HR traces for that intermediate DLL contain successful Encryption Change events and HR notifications. Their earlier failed attempts prevent any claim of reliable cold-start behavior.
+
+An earlier implementation checkpoint also received 60 HR samples over 60 seconds (03:21:37, DLL `1C0954BB39C0BDB6EA1D0A071AFEFDA54679519410532DDEDE687EA616FF3BFB`). Other earlier runs failed in discovery or initialization. Before explicit Windows unpair, an address-matched HCI trace recorded encryption status 0x06 (PIN or Key Missing). These outcomes must not be averaged into a blanket hardware-support claim.
+
+The remaining PMD failure occurs while the Windows security negotiation/pairing path is active. The available evidence does not distinguish OS policy/API behavior, adapter/driver interoperability and peripheral-side behavior well enough to blame one component. The tests used a Qualcomm FastConnect 7800 Dual Bluetooth Adapter, driver 3.1.0.1647, on Windows 11 Pro 10.0.26200. `READY` means preparation completed; only observed sensor samples demonstrate reception. Failed trials are preserved alongside successes.
+
+Local evidence is retained in `artifacts/native/bluetooth-diagnosis/` and `artifacts/native/connection-validation/` (logs, result JSON, local ETW). Current results are in `settled-native-hr.log`, `settled-mono-hr/Mono-live-hr.json`, `settled-il2cpp-hr/IL2CPP-live-hr.json`, `settled-editor-combined/Editor-live-hr-acc.json`, and the `settled-native-combined-20261030-035932` trace/log files. Raw Bluetooth traces and keys are not distributed. See [CONNECTION-FLOW.md](CONNECTION-FLOW.md) for the implementation, feature masks and reproduction commands. Long-duration 30-minute/4-hour trials, full original 491+49 behavior equivalence and GUI interaction validation remain outside these short tests.
 
 ## Earlier implementation checkpoints
 

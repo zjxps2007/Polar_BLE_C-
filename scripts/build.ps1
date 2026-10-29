@@ -34,7 +34,7 @@ if(-not $VisualStudioPath) {
         if(Test-Path -LiteralPath $vswhere){$VisualStudioPath=& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath}
     }
 }
-if(-not $VisualStudioPath){throw 'Install VS 2022 Build Tools with Desktop development with C++, Windows SDK >= 10.0.19041 and optional AddressSanitizer.'}
+if(-not $VisualStudioPath){throw 'Install VS 2022 Build Tools with Desktop development with C++, Windows SDK >= 10.0.22000 and optional AddressSanitizer.'}
 $vcvars=Join-Path $VisualStudioPath 'VC/Auxiliary/Build/vcvars64.bat'
 if($vcvars.Contains('"')){throw 'Invalid Visual Studio path'}
 # Import the toolchain environment once; build arguments stay an argument array.

@@ -14,6 +14,7 @@ foreach($pair in @(@('proto','Schemas~'),@('docs','Documentation~'),@('LICENSES'
 }
 Copy-Item -LiteralPath (Join-Path $root 'NOTICE') -Destination (Join-Path $package 'NOTICE.md') -Force
 Copy-Item -LiteralPath (Join-Path $root 'validation/NativeUnity/Runtime/PolarPerfRunner.cs') -Destination (Join-Path $project 'Assets/Validation/PolarPerfRunner.cs') -Force
+Copy-Item -LiteralPath (Join-Path $root 'validation/NativeUnity/Runtime/PolarLiveRunner.cs') -Destination (Join-Path $project 'Assets/Validation/PolarLiveRunner.cs') -Force
 Copy-Item -LiteralPath (Join-Path $root 'validation/NativeUnity/Editor/NativeBuild.cs') -Destination (Join-Path $project 'Assets/Validation/Editor/NativeBuild.cs') -Force
 Copy-Item -LiteralPath (Join-Path $root 'validation/NativeUnity/Editor/PlayStopCycles.cs') -Destination (Join-Path $project 'Assets/Validation/Editor/PlayStopCycles.cs') -Force
 @{dependencies=@{'com.polarble.sdk'=('file:'+($package.Replace('\','/')));'com.unity.modules.jsonserialize'='1.0.0';'com.unity.modules.imgui'='1.0.0'}} | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $project 'Packages/manifest.json') -Encoding utf8

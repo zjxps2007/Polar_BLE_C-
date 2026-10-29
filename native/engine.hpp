@@ -5,6 +5,7 @@ struct command : std::enable_shared_from_this<command> {
     polar_command c{};
     polar_request id = 0;
     uint64_t reconnect_from = 0;
+    uint32_t reconnect_failures = 0;
     std::chrono::steady_clock::time_point ready_at{};
     bytes data;
     std::string path;
@@ -80,7 +81,7 @@ class context : public std::enable_shared_from_this<context> {
     polar_result receive(uint64_t, view, uint64_t);
     void control();
     void decoder();
-    void reconnect(uint64_t previous_device, uint64_t address);
+    void reconnect(uint64_t previous_device, uint64_t address, view options = {});
 };
 uint64_t next_handle();
 std::unique_ptr<backend> make_windows_backend(std::weak_ptr<context>);

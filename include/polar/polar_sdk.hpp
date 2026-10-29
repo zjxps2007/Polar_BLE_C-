@@ -48,11 +48,18 @@ class context {
         c.flags = all;
         return submit(c);
     }
-    polar_request connect(uint64_t address, bool reconnect = false) {
+    polar_request connect(uint64_t address, bool reconnect = false,
+                          uint32_t features = POLAR_DEFAULT_FEATURES, bool authenticate = true) {
         polar_command c{};
         c.operation = POLAR_OP_CONNECT;
         c.address = address;
         c.flags = reconnect ? 2 : 0;
+        polar_connect_options options{
+            sizeof(options), features,
+            uint32_t(authenticate ? POLAR_AUTHENTICATE_WHEN_NEEDED : POLAR_AUTHENTICATION_DISABLED),
+            0};
+        c.data = reinterpret_cast<const uint8_t *>(&options);
+        c.data_length = sizeof(options);
         return submit(c);
     }
     polar_request initialize(polar_device device, uint32_t features = 0) {
@@ -66,6 +73,12 @@ class context {
         polar_command c{};
         c.operation = POLAR_OP_CAPABILITIES;
         c.device = device;
+        return submit(c);
+    }
+    polar_request unpair(uint64_t address) {
+        polar_command c{};
+        c.operation = POLAR_OP_UNPAIR;
+        c.address = address;
         return submit(c);
     }
     polar_request device_info(polar_device device) {

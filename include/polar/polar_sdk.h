@@ -37,7 +37,8 @@ enum {
     POLAR_OS_ERROR = -9,
     POLAR_BUSY = -10,
     POLAR_INTERNAL_ERROR = -11,
-    POLAR_DEVICE_ERROR = -12
+    POLAR_DEVICE_ERROR = -12,
+    POLAR_AUTHENTICATION_FAILED = -13
 };
 enum { POLAR_LATEST = 0, POLAR_LOSSLESS = 1 };
 /* INITIALIZE flags select a bitset of these IDs; zero requests all.
@@ -67,6 +68,31 @@ enum {
     POLAR_FEATURE_WATCHFACE = 20,
     POLAR_FEATURE_TELEMETRY = 21
 };
+#define POLAR_DEFAULT_FEATURES 7u /* HR, device information, battery */
+/* Optional CONNECT data (AUTO_CONNECT may append it after its 8-byte scan options).
+   Empty data uses these defaults. A zero
+   feature_mask explicitly requests transport only. Authentication occurs only
+   after a protected operation asks for it; no settings-app pre-pairing needed. */
+enum { POLAR_AUTHENTICATE_WHEN_NEEDED = 0, POLAR_AUTHENTICATION_DISABLED = 1 };
+typedef struct polar_connect_options {
+    uint32_t struct_size, feature_mask, authentication, reserved;
+} polar_connect_options;
+enum {
+    POLAR_CONNECTION_CONNECTING = 1,
+    POLAR_CONNECTION_DISCOVERING = 2,
+    POLAR_CONNECTION_NEGOTIATING = 3,
+    POLAR_CONNECTION_INITIALIZING = 4,
+    POLAR_CONNECTION_AUTHENTICATING = 5,
+    POLAR_CONNECTION_READY = 6,
+    POLAR_CONNECTION_FAILED = 7
+};
+/* CONNECTION_STATE payload. Its device handle is provisional until CONNECT
+   completes successfully (or RECONNECTED). READY is not proof of live samples.
+   pairing_status is Windows DevicePairingResultStatus, UINT32_MAX if not tried. */
+typedef struct polar_connection_state {
+    uint32_t state, requested_features, ready_features, unavailable_features;
+    uint32_t failed_features, max_pdu_size, pairing_status, authentication_attempts;
+} polar_connection_state;
 enum {
     POLAR_ECG = 0,
     POLAR_PPG = 1,
@@ -102,7 +128,8 @@ enum {
     POLAR_EVENT_DEVICE_INFO = 12,
     POLAR_EVENT_FEATURES = 13,
     POLAR_EVENT_REST = 14,
-    POLAR_EVENT_CONNECTING = 15
+    POLAR_EVENT_CONNECTING = 15,
+    POLAR_EVENT_CONNECTION_STATE = 16
 };
 enum {
     POLAR_OP_SCAN_START = 1,
@@ -121,6 +148,7 @@ enum {
     POLAR_OP_INITIALIZE = 14,
     POLAR_OP_DEVICE_INFO = 15,
     POLAR_OP_CAPABILITIES = 16,
+    POLAR_OP_UNPAIR = 17, /* Explicit recovery only; never called automatically. */
     POLAR_OP_PMD_FEATURES = 20,
     POLAR_OP_PMD_SETTINGS = 21,
     POLAR_OP_STREAM_START = 22,

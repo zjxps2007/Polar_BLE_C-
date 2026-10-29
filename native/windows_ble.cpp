@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "connection_policy.hpp"
 #include "pftp_request.pb.h"
 #include "services.hpp"
 #include "native_sdk.pb.h"
@@ -66,11 +67,14 @@ template <class Op> auto await(command &c, Op op, uint32_t timeout = 30000) {
         std::unique_lock l(c.async_gate);
         bool woke =
             c.wake.wait_for(l, std::chrono::milliseconds(c.c.timeout_ms ? c.c.timeout_ms : timeout),
-                            [&] { return *done || c.cancel->load(); });
-        if (!woke || c.cancel->load()) {
+                            [&] { return *done || c.cancel->load() || c.disconnected; });
+        if (!woke || c.cancel->load() || c.disconnected) {
+            const auto code = c.cancel->load() ? POLAR_CANCELLED
+                              : c.disconnected ? POLAR_DISCONNECTED
+                                               : POLAR_TIMEOUT;
+            l.unlock(); // Cancel may synchronously deliver Completed.
             op.Cancel();
-            throw failure(c.cancel->load() ? POLAR_CANCELLED : POLAR_TIMEOUT,
-                          "Windows BLE operation cancelled/timed out");
+            throw failure(code, "Windows BLE operation cancelled, disconnected or timed out");
         }
     }
     return op.GetResults();
@@ -88,13 +92,25 @@ struct connected {
     uint64_t id = 0;
     std::atomic_bool stale = false, initialized = false;
     std::atomic_bool auto_reconnect = false;
+    std::atomic_bool link_seen = false;
+    std::atomic_uint32_t phase = POLAR_CONNECTION_CONNECTING;
+    polar_connect_options options{sizeof(polar_connect_options), POLAR_DEFAULT_FEATURES, 0, 0};
+    uint32_t requested_features = 0, ready_features = 0, unavailable_features = 0,
+             failed_features = 0, pairing_status = UINT32_MAX, authentication_attempts = 0;
+    bool authentication_failed = false;
+    std::optional<failure> authentication_error;
     BluetoothLEDevice device{nullptr};
     GattSession session{nullptr};
     event_token disconnected{};
+    event_token pdu_changed{}, parameters_changed{}, phy_changed{};
+    bool has_parameter_events = false;
+    BluetoothLEPreferredConnectionParametersRequest parameter_request{nullptr};
     std::map<guid, GattDeviceService> services;
     std::map<std::pair<guid, guid>, GattCharacteristic> chars;
     std::map<guid, std::pair<GattCharacteristic, event_token>> subscriptions;
     std::mutex gate;
+    std::weak_ptr<command> active;
+    std::chrono::steady_clock::time_point negotiation_changed = std::chrono::steady_clock::now();
     std::map<uint32_t, uint64_t> streams;
     std::weak_ptr<command> pending;
     std::weak_ptr<command> notification_waiter;
@@ -104,26 +120,53 @@ struct connected {
     int telemetry_sequence = -1;
     sdk::DeviceSnapshot snapshot;
     std::optional<pftp_assembler> notification;
-    void close() {
+    void close() noexcept {
+        auto cleanup = [](auto action) noexcept {
+            try {
+                action();
+            } catch (...) {
+            }
+        };
         stale = true;
         for (auto &[key, s] : subscriptions)
-            s.first.ValueChanged(s.second);
+            cleanup([&] { s.first.ValueChanged(s.second); });
         subscriptions.clear();
         if (device)
-            device.ConnectionStatusChanged(disconnected);
+            cleanup([&] { device.ConnectionStatusChanged(disconnected); });
+        if (has_parameter_events && device) {
+            cleanup([&] { device.ConnectionParametersChanged(parameters_changed); });
+            cleanup([&] { device.ConnectionPhyChanged(phy_changed); });
+        }
+        if (session)
+            cleanup([&] { session.MaxPduSizeChanged(pdu_changed); });
+        if (parameter_request) {
+            cleanup([&] { parameter_request.Close(); });
+            parameter_request = nullptr;
+        }
         chars.clear();
         for (auto &[key, s] : services)
-            s.Close();
+            cleanup([&] { s.Close(); });
         services.clear();
         if (session) {
-            session.MaintainConnection(false);
-            session.Close();
+            cleanup([&] { session.MaintainConnection(false); });
+            cleanup([&] { session.Close(); });
             session = nullptr;
         }
         if (device) {
-            device.Close();
+            cleanup([&] { device.Close(); });
             device = nullptr;
         }
+    }
+};
+struct active_request {
+    std::shared_ptr<connected> device;
+    explicit active_request(std::shared_ptr<connected> d, command &c) : device(std::move(d)) {
+        std::lock_guard l(device->gate);
+        device->active = c.weak_from_this();
+    }
+    ~active_request() {
+        std::lock_guard l(device->gate);
+        device->active.reset();
     }
 };
 class windows_backend final : public backend {
@@ -142,6 +185,230 @@ class windows_backend final : public backend {
         radio_active.reset();
     }
     std::map<uint64_t, std::shared_ptr<connected>> devices;
+    static void alive(command &c, const std::shared_ptr<connected> &d) {
+        if (c.cancel->load())
+            throw failure(POLAR_CANCELLED, "Connection request cancelled");
+        if (d->stale)
+            throw failure(POLAR_DISCONNECTED, "Connection session ended");
+    }
+    static void delay(command &c, const std::shared_ptr<connected> &d, uint32_t ms) {
+        alive(c, d);
+        std::unique_lock l(c.async_gate);
+        c.wake.wait_for(l, std::chrono::milliseconds(ms),
+                        [&] { return c.cancel->load() || c.disconnected || d->stale; });
+        l.unlock();
+        alive(c, d);
+    }
+    void state(command &c, const std::shared_ptr<connected> &d, uint32_t phase, int error = 0) {
+        d->phase = phase;
+        if (auto root = owner.lock()) {
+            uint32_t pdu = 0;
+            try {
+                if (d->session)
+                    pdu = d->session.MaxPduSize();
+            } catch (...) {
+            }
+            polar_connection_state status{phase,
+                                          d->requested_features,
+                                          d->ready_features,
+                                          d->unavailable_features,
+                                          d->failed_features,
+                                          pdu,
+                                          d->pairing_status,
+                                          d->authentication_attempts};
+            event e{};
+            e.e.type = POLAR_EVENT_CONNECTION_STATE;
+            e.e.request = c.id;
+            e.e.device = d->id;
+            e.e.flags = phase;
+            e.e.result = error;
+            auto b = reinterpret_cast<const uint8_t *>(&status);
+            e.data.assign(b, b + sizeof(status));
+            root->push(std::move(e));
+        }
+    }
+    static void changed(const std::weak_ptr<connected> &weak) noexcept {
+        if (auto d = weak.lock(); d && !d->stale) {
+            std::shared_ptr<command> request;
+            {
+                std::lock_guard l(d->gate);
+                d->negotiation_changed = std::chrono::steady_clock::now();
+                request = d->active.lock();
+            }
+            if (request)
+                request->wake.notify_all();
+        }
+    }
+    void negotiate(command &c, const std::shared_ptr<connected> &d) {
+        state(c, d, POLAR_CONNECTION_NEGOTIATING);
+        const auto began = std::chrono::steady_clock::now();
+        const auto limit = began + std::chrono::milliseconds(6000);
+        // Windows owns MTU and PHY negotiation. Observe its events; do not send
+        // Android HCI commands. Device6 is optional on the Windows 10 baseline.
+        if (d->device.try_as<IBluetoothLEDevice6>()) {
+            try {
+                d->parameter_request = d->device.RequestPreferredConnectionParameters(
+                    BluetoothLEPreferredConnectionParameters::Balanced());
+            } catch (const hresult_error &e) {
+                event diagnostic{};
+                diagnostic.e.type = POLAR_EVENT_DIAGNOSTIC;
+                diagnostic.e.request = c.id;
+                diagnostic.e.device = d->id;
+                diagnostic.e.hresult = e.code().value;
+                diagnostic.e.stage = 50; // Optional connection parameter preference.
+                if (auto root = owner.lock())
+                    root->push(std::move(diagnostic));
+            }
+        }
+        std::unique_lock lock(c.async_gate);
+        for (;;) {
+            alive(c, d);
+            std::chrono::steady_clock::time_point last;
+            {
+                std::lock_guard l(d->gate);
+                last = std::max(began, d->negotiation_changed);
+            }
+            const auto until = std::min(limit, last + std::chrono::milliseconds(1200));
+            if (std::chrono::steady_clock::now() >= until)
+                break;
+            c.wake.wait_until(lock, until);
+        }
+    }
+    void authenticate(command &c, const std::shared_ptr<connected> &d, uint32_t attempt,
+                      bool explicit_bond) {
+        d->authentication_attempts = attempt;
+        state(c, d, POLAR_CONNECTION_AUTHENTICATING);
+        delay(c, d, 500);
+        // WinRT can negotiate encryption as part of the protected ATT operation.
+        // First retry that operation with EncryptionRequired; request an explicit
+        // bond only if the device still rejects security on the next attempt.
+        if (attempt == 1 && !explicit_bond)
+            return;
+        // BluetoothLEDevice's DeviceInformation is a snapshot; pairing may have
+        // changed while Windows was discovering services. Fetch a fresh object.
+        auto information =
+            await(c, DeviceInformation::CreateFromIdAsync(d->device.DeviceInformation().Id()));
+        auto pair = information.Pairing();
+        if (!pair.IsPaired()) {
+            auto custom = pair.Custom();
+            auto weak = c.weak_from_this();
+            std::weak_ptr<connected> device = d;
+            auto token = custom.PairingRequested([weak, device](auto const &, auto const &args) {
+                auto request = weak.lock();
+                auto live = device.lock();
+                if (request && live && !request->cancel->load() && !live->stale &&
+                    args.PairingKind() == DevicePairingKinds::ConfirmOnly)
+                    args.Accept();
+            });
+            try {
+                auto r = await(c, custom.PairAsync(DevicePairingKinds::ConfirmOnly,
+                                                   DevicePairingProtectionLevel::Encryption));
+                d->pairing_status = uint32_t(r.Status());
+                if (r.Status() != DevicePairingResultStatus::Paired &&
+                    r.Status() != DevicePairingResultStatus::AlreadyPaired)
+                    throw failure(POLAR_AUTHENTICATION_FAILED,
+                                  "Windows authentication failed; pairing status " +
+                                      std::to_string(d->pairing_status));
+                custom.PairingRequested(token);
+            } catch (...) {
+                custom.PairingRequested(token);
+                throw;
+            }
+        } else
+            d->pairing_status = uint32_t(DevicePairingResultStatus::AlreadyPaired);
+        // Keep the same GATT session and the original ATT operation alive.
+        delay(c, d, 500);
+    }
+    template <class Perform>
+    auto secure(command &c, const std::shared_ptr<connected> &d,
+                const GattCharacteristic &characteristic, uint32_t stage, Perform perform) {
+        auto previous = d->phase.load();
+        uint32_t last_att = 0;
+        try {
+            auto r = authenticated_operation(
+                [&] {
+                    const auto budget =
+                        std::min<uint32_t>(12000, c.c.timeout_ms ? c.c.timeout_ms : 12000);
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
+                    return settle_security(
+                        [&] {
+                            alive(c, d);
+                            return await(c, perform());
+                        },
+                        [&](auto const &r) {
+                            const auto att =
+                                r.ProtocolError() ? uint32_t(r.ProtocolError().Value()) : 0;
+                            // Windows can return Unreachable while its link encryption
+                            // is still negotiating. Keep the session alive for reads and
+                            // CCCD writes, whose repeated execution is idempotent. Never
+                            // replay an arbitrary write with an uncertain outcome.
+                            return stage != 5 && d->phase == POLAR_CONNECTION_AUTHENTICATING &&
+                                   d->authentication_attempts == 1 &&
+                                   (att == 5 || att == 15 ||
+                                    r.Status() == GattCommunicationStatus::Unreachable);
+                        },
+                        [&] { delay(c, d, 500); },
+                        [&] { return std::chrono::steady_clock::now() < deadline; });
+                },
+                [&](auto const &r) {
+                    const auto att = r.ProtocolError() ? uint32_t(r.ProtocolError().Value()) : 0;
+                    if (att)
+                        last_att = att;
+                    // WinRT may report Unreachable when automatic encryption
+                    // cannot start, while this GATT session is still alive.
+                    return security_retry_needed(
+                        att, stage != 5 && r.Status() == GattCommunicationStatus::Unreachable,
+                        d->phase == POLAR_CONNECTION_AUTHENTICATING ? d->authentication_attempts
+                                                                    : 0,
+                        last_att);
+                },
+                [&](uint32_t attempt) {
+                    if (d->authentication_failed)
+                        throw failure(POLAR_AUTHENTICATION_FAILED,
+                                      "Authentication recovery exhausted for this session");
+                    authenticate(c, d, attempt, stage == 5);
+                    characteristic.ProtectionLevel(GattProtectionLevel::EncryptionRequired);
+                },
+                [&] { alive(c, d); }, d->options.authentication == POLAR_AUTHENTICATE_WHEN_NEEDED);
+            checked(r, stage);
+            if (d->phase == POLAR_CONNECTION_AUTHENTICATING)
+                state(c, d, previous);
+            return r;
+        } catch (const failure &error) {
+            auto f = error;
+            if (!f.stage)
+                f.stage = stage;
+            if (f.code != POLAR_CANCELLED && (f.code == POLAR_AUTHENTICATION_FAILED ||
+                                              d->phase == POLAR_CONNECTION_AUTHENTICATING)) {
+                f.code = POLAR_AUTHENTICATION_FAILED;
+                f.att = last_att;
+                f.stage = stage;
+                d->authentication_failed = true;
+                d->authentication_error = f;
+                d->auto_reconnect = false;
+                state(c, d, POLAR_CONNECTION_FAILED, f.code);
+            }
+            throw f;
+        } catch (const hresult_error &error) {
+            if (d->phase != POLAR_CONNECTION_AUTHENTICATING) {
+                failure f(POLAR_OS_ERROR, to_string(error.message()));
+                f.hresult = error.code().value;
+                f.stage = stage;
+                throw f;
+            }
+            d->authentication_failed = true;
+            d->auto_reconnect = false;
+            failure f(POLAR_AUTHENTICATION_FAILED,
+                      "Windows pairing: " + to_string(error.message()));
+            f.hresult = error.code().value;
+            f.att = last_att;
+            f.stage = stage;
+            d->authentication_error = f;
+            state(c, d, POLAR_CONNECTION_FAILED, f.code);
+            throw f;
+        }
+    }
     std::shared_ptr<connected> get(uint64_t id) {
         auto i = devices.find(id);
         if (i == devices.end() || i->second->stale)
@@ -167,13 +434,7 @@ class windows_backend final : public backend {
     }
     bytes read(command &c, std::shared_ptr<connected> const &d, guid service, guid ch) {
         auto a = characteristic(c, d, service, ch);
-        auto r = await(c, a.ReadValueAsync(BluetoothCacheMode::Uncached));
-        if (r.ProtocolError() &&
-            (r.ProtocolError().Value() == 5 || r.ProtocolError().Value() == 15)) {
-            a.ProtectionLevel(GattProtectionLevel::EncryptionRequired);
-            r = await(c, a.ReadValueAsync(BluetoothCacheMode::Uncached));
-        }
-        checked(r, 4);
+        auto r = secure(c, d, a, 4, [&] { return a.ReadValueAsync(BluetoothCacheMode::Uncached); });
         return from_buffer(r.Value());
     }
     void write(command &c, std::shared_ptr<connected> const &d, guid service, guid ch, view data,
@@ -183,13 +444,7 @@ class windows_backend final : public backend {
             throw failure(POLAR_INVALID_ARGUMENT, "Write exceeds negotiated ATT payload");
         auto option =
             response ? GattWriteOption::WriteWithResponse : GattWriteOption::WriteWithoutResponse;
-        auto r = await(c, a.WriteValueWithResultAsync(to_buffer(data), option));
-        if (r.ProtocolError() &&
-            (r.ProtocolError().Value() == 5 || r.ProtocolError().Value() == 15)) {
-            a.ProtectionLevel(GattProtectionLevel::EncryptionRequired);
-            r = await(c, a.WriteValueWithResultAsync(to_buffer(data), option));
-        }
-        checked(r, 5);
+        secure(c, d, a, 5, [&] { return a.WriteValueWithResultAsync(to_buffer(data), option); });
     }
     uint32_t mtu(std::shared_ptr<connected> const &d) {
         return d->session ? std::min<uint32_t>(512, d->session.MaxPduSize() - 3) : 20;
@@ -341,15 +596,9 @@ class windows_backend final : public backend {
             d->subscriptions.emplace(ch, std::make_pair(a, token));
         }
         try {
-            auto r =
-                await(c, a.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(mode));
-            if (r.ProtocolError() &&
-                (r.ProtocolError().Value() == 5 || r.ProtocolError().Value() == 15)) {
-                a.ProtectionLevel(GattProtectionLevel::EncryptionRequired);
-                r = await(c,
-                          a.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(mode));
-            }
-            checked(r, 6);
+            secure(c, d, a, 6, [&] {
+                return a.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(mode);
+            });
         } catch (...) {
             if (enabled) {
                 auto i = d->subscriptions.find(ch);
@@ -502,7 +751,8 @@ class windows_backend final : public backend {
         }
     }
 
-    void initialize(command &c, const std::shared_ptr<connected> &d, event &result, bool dis_only) {
+    void initialize(command &c, const std::shared_ptr<connected> &d, event &result, bool dis_only,
+                    uint32_t selected = UINT32_MAX) {
         struct probe {
             uint32_t state = 0;
             int result = 0, hresult = 0;
@@ -515,7 +765,9 @@ class windows_backend final : public backend {
         snapshot.clear_services();
         for (auto &[uuid, service] : d->services)
             snapshot.add_services(&uuid, 16);
-        uint32_t requested = dis_only ? 2u : (c.c.flags ? c.c.flags : 0x3fffffu);
+        uint32_t requested = selected != UINT32_MAX ? selected
+                             : dis_only             ? 2u
+                                                    : (c.c.flags ? c.c.flags : 0x3fffffu);
         require((requested & ~0x3fffffu) == 0, "Unknown requested feature bits");
         const std::array<uint32_t, 22> dependencies{1,  2,  4,  8,  24, 16, 16, 16, 8,  16, 32,
                                                     24, 16, 16, 16, 16, 16, 16, 16, 64, 16, 128};
@@ -532,10 +784,33 @@ class windows_backend final : public backend {
                 return;
             }
             try {
+                if (d->authentication_failed)
+                    throw failure(POLAR_AUTHENTICATION_FAILED,
+                                  "Authentication failed for this session");
+                alive(c, d);
+                if (auto root = owner.lock()) {
+                    static const char *names[] = {
+                        "Preparing HR notifications",
+                        "Reading device information",
+                        "Preparing battery notifications",
+                        "Preparing PMD control/data notifications and features",
+                        "Preparing PSFTP",
+                        "Preparing thermometer",
+                        "Preparing PFCS",
+                        "Preparing telemetry"};
+                    event progress{};
+                    progress.e.type = POLAR_EVENT_DIAGNOSTIC;
+                    progress.e.request = c.id;
+                    progress.e.device = d->id;
+                    progress.e.stage = uint32_t(60 + index);
+                    const auto *name = names[index];
+                    progress.data.assign(name, name + std::strlen(name));
+                    root->push(std::move(progress));
+                }
                 action();
                 p.state = 1;
             } catch (const failure &f) {
-                if (f.code == POLAR_CANCELLED)
+                if (f.code == POLAR_CANCELLED || f.code == POLAR_DISCONNECTED)
                     throw;
                 p.state = f.code == POLAR_NOT_SUPPORTED ? 2 : 3;
                 p.result = f.code;
@@ -547,14 +822,15 @@ class windows_backend final : public backend {
                 p.hresult = e.code().value;
             }
         };
-        run(0, hr_service, [&] { characteristic(c, d, hr_service, hr_data); });
+        run(0, hr_service, [&] { subscribe(c, d, hr_service, hr_data); });
         run(1, dis_service, [&] {
             snapshot.clear_attributes();
             auto chars = await(
                 c,
                 d->services.at(dis_service).GetCharacteristicsAsync(BluetoothCacheMode::Uncached));
             checked(chars, 3);
-            for (auto ch : chars.Characteristics())
+            for (auto ch : chars.Characteristics()) {
+                d->chars.emplace(std::make_pair(dis_service, ch.Uuid()), ch);
                 if ((ch.CharacteristicProperties() & GattCharacteristicProperties::Read) !=
                     GattCharacteristicProperties::None) {
                     auto b = read(c, d, dis_service, ch.Uuid());
@@ -566,6 +842,7 @@ class windows_backend final : public backend {
                                       id == guid{L"00002a50-0000-1000-8000-00805f9b34fb"} ||
                                       id == guid{L"00002a2a-0000-1000-8000-00805f9b34fb"});
                 }
+            }
         });
         run(2, bas_service, [&] {
             auto chars = await(
@@ -573,16 +850,28 @@ class windows_backend final : public backend {
                 d->services.at(bas_service).GetCharacteristicsAsync(BluetoothCacheMode::Uncached));
             checked(chars, 3);
             bool supported = false;
-            for (auto ch : chars.Characteristics())
-                supported |= ch.Uuid() == bas_level || ch.Uuid() == bas_status;
+            for (auto ch : chars.Characteristics()) {
+                d->chars.emplace(std::make_pair(bas_service, ch.Uuid()), ch);
+                if (ch.Uuid() == bas_level || ch.Uuid() == bas_status) {
+                    supported = true;
+                    auto properties = ch.CharacteristicProperties();
+                    if ((properties & GattCharacteristicProperties::Read) !=
+                        GattCharacteristicProperties::None)
+                        read(c, d, bas_service, ch.Uuid());
+                    if ((properties & (GattCharacteristicProperties::Notify |
+                                       GattCharacteristicProperties::Indicate)) !=
+                        GattCharacteristicProperties::None)
+                        subscribe(c, d, bas_service, ch.Uuid());
+                }
+            }
             if (!supported)
                 throw failure(POLAR_NOT_SUPPORTED, "Battery characteristics absent");
         });
         run(3, pmd_service, [&] {
-            auto b = read(c, d, pmd_service, pmd_cp);
-            require(b.size() >= 3, "PMD feature bytes");
             subscribe(c, d, pmd_service, pmd_cp);
             subscribe(c, d, pmd_service, pmd_data);
+            auto b = read(c, d, pmd_service, pmd_cp);
+            require(b.size() >= 3, "PMD feature bytes");
             snapshot.set_pmd_features(b.data(), b.size());
         });
         run(4, ftp_service, [&] {
@@ -654,6 +943,53 @@ class windows_backend final : public backend {
             e.data = result.data;
             context->push(std::move(e));
         }
+    }
+
+    void prepare(command &c, const std::shared_ptr<connected> &d, uint32_t features, event &result,
+                 bool strict = true) {
+        alive(c, d);
+        d->requested_features |= features;
+        state(c, d, POLAR_CONNECTION_INITIALIZING);
+        initialize(c, d, result, false, features);
+        d->ready_features = d->unavailable_features = d->failed_features = 0;
+        std::optional<failure> failed;
+        for (const auto &f : d->snapshot.features()) {
+            const auto bit = 1u << f.feature();
+            if (f.state() == 1)
+                d->ready_features |= bit;
+            else if (f.state() == 2)
+                d->unavailable_features |= bit;
+            else if (f.state() == 3) {
+                d->failed_features |= bit;
+                if ((features & bit) && !failed) {
+                    failed.emplace(f.result() < 0 ? f.result() : POLAR_OS_ERROR,
+                                   "Feature initialization failed: " + std::to_string(f.feature()));
+                    failed->att = f.att_error();
+                    failed->hresult = f.hresult();
+                    failed->stage = 51;
+                }
+            }
+        }
+        // Preserve the specific authentication failure even if disconnect came
+        // during negotiation. A stale handle must never be announced as ready.
+        if (failed && strict) {
+            if (failed->code == POLAR_AUTHENTICATION_FAILED && d->authentication_error)
+                failed = d->authentication_error;
+            state(c, d, POLAR_CONNECTION_FAILED, failed->code);
+            throw *failed;
+        }
+        alive(c, d);
+        state(c, d, failed ? POLAR_CONNECTION_FAILED : POLAR_CONNECTION_READY,
+              failed ? failed->code : POLAR_OK);
+    }
+    void require_feature(command &c, const std::shared_ptr<connected> &d, uint32_t feature) {
+        const auto mask = 1u << feature;
+        if (!(d->ready_features & mask)) {
+            event prepared{};
+            prepare(c, d, mask, prepared);
+        }
+        if (!(d->ready_features & mask))
+            throw failure(POLAR_NOT_SUPPORTED, "Requested stream feature is unavailable");
     }
 
   public:
@@ -783,8 +1119,8 @@ class windows_backend final : public backend {
             // Optional data: int32 minimum RSSI, uint32 settle milliseconds; path is a name prefix.
             int minimum = -70;
             uint32_t settle = 1500;
+            auto options = automatic_connection_options(c.data);
             if (!c.data.empty()) {
-                require(c.data.size() == 8, "Auto-connect options size");
                 minimum = int32_t(u(c.data, 0, 4));
                 settle = uint32_t(u(c.data, 4, 4));
             }
@@ -845,13 +1181,18 @@ class windows_backend final : public backend {
                 throw;
             }
             auto saved = c.c;
+            auto saved_data = std::move(c.data);
+            auto option_bytes = reinterpret_cast<const uint8_t *>(&options);
+            c.data.assign(option_bytes, option_bytes + sizeof(options));
             c.c.operation = POLAR_OP_CONNECT;
             c.c.address = address;
             try {
                 execute(c, result);
                 c.c = saved;
+                c.data = std::move(saved_data);
             } catch (...) {
                 c.c = saved;
+                c.data = std::move(saved_data);
                 throw;
             }
             return;
@@ -901,7 +1242,8 @@ class windows_backend final : public backend {
             le(result.data, state, 4);
             return;
         }
-        if (op == POLAR_OP_CONNECT || op == POLAR_OP_PAIR_STATE || op == POLAR_OP_PAIR) {
+        if (op == POLAR_OP_CONNECT || op == POLAR_OP_PAIR_STATE || op == POLAR_OP_PAIR ||
+            op == POLAR_OP_UNPAIR) {
             if (op == POLAR_OP_CONNECT) {
                 event e{};
                 e.e.type = POLAR_EVENT_CONNECTING;
@@ -910,7 +1252,10 @@ class windows_backend final : public backend {
                 root->push(std::move(e));
             }
             for (auto it = devices.begin(); it != devices.end();)
-                if (it->second->stale) {
+                if (it->second->stale || (op == POLAR_OP_UNPAIR &&
+                                          it->second->device.BluetoothAddress() == c.c.address)) {
+                    if (op == POLAR_OP_UNPAIR)
+                        root->invalidate_device(it->first, POLAR_DISCONNECTED);
                     it->second->close();
                     it = devices.erase(it);
                 } else
@@ -918,12 +1263,34 @@ class windows_backend final : public backend {
             require(c.c.address > 0 && c.c.address <= 0xffffffffffffull,
                     "Invalid Bluetooth address");
             auto d = std::make_shared<connected>();
+            d->options = connection_options(c.data);
+            d->id = next_handle();
+            d->requested_features = d->options.feature_mask;
+            if (op == POLAR_OP_CONNECT)
+                state(c, d, POLAR_CONNECTION_CONNECTING);
             d->device = await(c, BluetoothLEDevice::FromBluetoothAddressAsync(c.c.address));
             if (!d->device)
                 throw failure(POLAR_OS_ERROR, "BluetoothLEDevice unavailable");
             auto pair = d->device.DeviceInformation().Pairing();
+            if (op == POLAR_OP_UNPAIR) {
+                try {
+                    auto r = await(c, pair.UnpairAsync());
+                    le(result.data, uint32_t(r.Status()), 4);
+                    if (r.Status() != DeviceUnpairingResultStatus::Unpaired &&
+                        r.Status() != DeviceUnpairingResultStatus::AlreadyUnpaired)
+                        throw failure(POLAR_OS_ERROR, "Windows unpair failed: " +
+                                                          std::to_string(uint32_t(r.Status())));
+                    d->device.Close();
+                    return;
+                } catch (...) {
+                    d->close();
+                    throw;
+                }
+            }
             if (op == POLAR_OP_PAIR_STATE) {
-                le(result.data, pair.IsPaired(), 4);
+                auto current_information = await(
+                    c, DeviceInformation::CreateFromIdAsync(d->device.DeviceInformation().Id()));
+                le(result.data, current_information.Pairing().IsPaired(), 4);
                 le(result.data, pair.CanPair(), 4);
                 le(result.data, uint32_t(pair.ProtectionLevel()), 4);
                 d->device.Close();
@@ -950,8 +1317,9 @@ class windows_backend final : public backend {
                     throw;
                 }
             }
-            d->id = next_handle();
             d->auto_reconnect = (c.c.flags & 2) != 0;
+            d->link_seen = d->device.ConnectionStatus() == BluetoothConnectionStatus::Connected;
+            active_request active(d, c);
             auto ctx = owner;
             std::weak_ptr<connected> weak = d;
             d->disconnected = d->device.ConnectionStatusChanged(
@@ -959,16 +1327,32 @@ class windows_backend final : public backend {
                     try {
                         auto dev = weak.lock();
                         auto root = ctx.lock();
-                        if (!dev || !root || dev->stale || !dev->initialized ||
-                            sender.ConnectionStatus() != BluetoothConnectionStatus::Disconnected)
+                        if (!dev || !root || dev->stale)
+                            return;
+                        if (sender.ConnectionStatus() == BluetoothConnectionStatus::Connected) {
+                            dev->link_seen = true;
+                            changed(weak);
+                            return;
+                        }
+                        if (!dev->link_seen)
                             return;
                         if (dev->stale.exchange(true))
                             return;
+                        const bool authenticating = dev->phase == POLAR_CONNECTION_AUTHENTICATING;
+                        if (authenticating)
+                            dev->auto_reconnect = false;
                         root->invalidate_device(dev->id, POLAR_DISCONNECTED);
                         std::shared_ptr<command> pending;
+                        std::shared_ptr<command> operation;
                         {
                             std::lock_guard l(dev->gate);
                             pending = dev->pending.lock();
+                            operation = dev->active.lock();
+                        }
+                        if (operation) {
+                            std::lock_guard l(operation->async_gate);
+                            operation->disconnected = true;
+                            operation->wake.notify_all();
                         }
                         if (pending) {
                             std::lock_guard l(pending->async_gate);
@@ -991,40 +1375,74 @@ class windows_backend final : public backend {
                         }
                         e.e.device = dev->id;
                         e.e.result = POLAR_DISCONNECTED;
-                        root->push(std::move(e));
-                        if (dev->auto_reconnect)
-                            root->reconnect(dev->id, sender.BluetoothAddress());
+                        // The still-running CONNECT owns its failure completion.
+                        if (dev->initialized)
+                            root->push(std::move(e));
+                        if (dev->initialized && dev->auto_reconnect) {
+                            auto options = reinterpret_cast<const uint8_t *>(&dev->options);
+                            root->reconnect(dev->id, sender.BluetoothAddress(),
+                                            {options, sizeof(dev->options)});
+                        }
                     } catch (...) {
                     }
                 });
             try {
                 d->session =
                     await(c, GattSession::FromDeviceIdAsync(d->device.BluetoothDeviceId()));
-                if (d->session)
+                if (d->session) {
+                    d->pdu_changed = d->session.MaxPduSizeChanged(
+                        [weak](auto const &, auto const &) { changed(weak); });
                     d->session.MaintainConnection(true);
+                }
+                if (d->device.try_as<IBluetoothLEDevice6>()) {
+                    d->parameters_changed = d->device.ConnectionParametersChanged(
+                        [weak](auto const &, auto const &) { changed(weak); });
+                    d->phy_changed = d->device.ConnectionPhyChanged(
+                        [weak](auto const &, auto const &) { changed(weak); });
+                    d->has_parameter_events = true;
+                }
+                state(c, d, POLAR_CONNECTION_DISCOVERING);
                 auto r = await(c, d->device.GetGattServicesAsync(
                                       c.c.flags & 1 ? BluetoothCacheMode::Cached
                                                     : BluetoothCacheMode::Uncached));
                 checked(r, 2);
                 for (auto s : r.Services())
                     d->services.emplace(s.Uuid(), s);
-                d->initialized = true;
-                if (c.cancel->load())
-                    throw failure(POLAR_CANCELLED, "Connect cancelled");
-                devices.emplace(d->id, d);
                 d->snapshot.set_address(c.c.address);
                 d->snapshot.set_name(to_string(d->device.Name()));
                 for (auto &[id, service] : d->services)
                     d->snapshot.add_services(&id, 16);
+                negotiate(c, d);
+                event prepared{};
+                prepare(c, d, d->options.feature_mask, prepared);
+                alive(c, d);
+                devices.emplace(d->id, d);
+                d->initialized = true;
                 result.e.device = d->id;
                 le(result.data, mtu(d), 4);
-                le(result.data, pair.IsPaired(), 4);
+                auto current_information = await(
+                    c, DeviceInformation::CreateFromIdAsync(d->device.DeviceInformation().Id()));
+                le(result.data, current_information.Pairing().IsPaired(), 4);
                 for (auto &[id, s] : d->services) {
                     auto raw = reinterpret_cast<const uint8_t *>(&id);
                     result.data.insert(result.data.end(), raw, raw + 16);
                 }
+                alive(c, d);
                 return;
             } catch (...) {
+                devices.erase(d->id);
+                if (d->phase != POLAR_CONNECTION_FAILED) {
+                    int code = POLAR_INTERNAL_ERROR;
+                    try {
+                        throw;
+                    } catch (const failure &f) {
+                        code = f.code;
+                    } catch (const hresult_error &) {
+                        code = POLAR_OS_ERROR;
+                    } catch (...) {
+                    }
+                    state(c, d, POLAR_CONNECTION_FAILED, code);
+                }
                 d->close();
                 throw;
             }
@@ -1046,8 +1464,13 @@ class windows_backend final : public backend {
             return;
         }
         auto d = get(c.c.device);
+        active_request active(d, c);
+        alive(c, d);
         if (op == POLAR_OP_INITIALIZE || op == POLAR_OP_DEVICE_INFO) {
-            initialize(c, d, result, op == POLAR_OP_DEVICE_INFO);
+            if (op == POLAR_OP_INITIALIZE)
+                prepare(c, d, c.c.flags ? c.c.flags : 0x3fffffu, result, false);
+            else
+                initialize(c, d, result, true);
             return;
         }
         if (op == POLAR_OP_CAPABILITIES) {
@@ -1113,6 +1536,11 @@ class windows_backend final : public backend {
         }
         if (op == POLAR_OP_STREAM_START) {
             require(c.c.measurement <= POLAR_BATTERY_STATUS, "Unknown stream type");
+            require_feature(c, d,
+                            c.c.measurement < POLAR_HR             ? POLAR_FEATURE_STREAMING
+                            : c.c.measurement == POLAR_HR          ? POLAR_FEATURE_HR
+                            : c.c.measurement == POLAR_THERMOMETER ? POLAR_FEATURE_THERMOMETER
+                                                                   : POLAR_FEATURE_BATTERY);
             {
                 std::lock_guard l(d->gate);
                 if (d->streams.contains(c.c.measurement))

@@ -31,7 +31,7 @@ namespace Polar.Native
         public event Action<Event,NativeArray<byte>,int> EventReceived;
         public PolarContext(OverflowPolicy policy=OverflowPolicy.Latest,int sampleCapacity=4096)
         {
-            if(Api.polar_sdk_abi_version()!=2||sizeof(Sample)!=896||sizeof(Command)!=104||sizeof(Event)!=72)throw new InvalidOperationException("Polar native ABI mismatch");
+            if(Api.polar_sdk_abi_version()!=2||sizeof(Sample)!=896||sizeof(Command)!=104||sizeof(Event)!=72||sizeof(ConnectOptions)!=16||sizeof(ConnectionState)!=32)throw new InvalidOperationException("Polar native ABI mismatch");
             var config=new Config { StructSize=(uint)sizeof(Config),AbiVersion=2,SampleCapacity=(uint)sampleCapacity,IngressCapacity=256,EventCapacity=256,OverflowPolicy=(uint)policy,TimeoutMs=30000 };
             Check(Api.polar_sdk_create(in config,out handle));
             eventBuffer=new NativeArray<byte>(65536,Allocator.Persistent,NativeArrayOptions.UninitializedMemory);
@@ -43,10 +43,23 @@ namespace Polar.Native
         public ulong Scan()=>Submit(new Command { Operation=Operation.ScanStart });
         public ulong Initialize(ulong device,uint features=0)=>Submit(new Command {Operation=Operation.Initialize,Device=device,Flags=features});
         public ulong Capabilities(ulong device)=>Submit(new Command {Operation=Operation.Capabilities,Device=device});
+        // Explicit recovery of a stale Windows bond; Connect never unpairs automatically.
+        public ulong Unpair(ulong address)=>Submit(new Command {Operation=Operation.Unpair,Address=address});
         public ulong DeviceInfo(ulong device)=>Submit(new Command {Operation=Operation.DeviceInfo,Device=device});
         public ulong ObserveRadio(bool enabled=true)=>Submit(new Command {Operation=Operation.Radio,Flags=enabled?1u:2u});
         public ulong HrBroadcasts(ulong[] addresses=null,bool deduplicate=true) {fixed(ulong* p=addresses)return Submit(new Command {Operation=Operation.ScanStart,Flags=4u|(deduplicate?2u:0u),Data=(byte*)p,DataLength=(uint)(addresses?.Length??0)*8});}
-        public ulong Connect(ulong address,bool automaticReconnect=false)=>Submit(new Command { Operation=Operation.Connect,Address=address,Flags=automaticReconnect?2u:0u });
+        // Connect completion means the native core finished preparing the requested features.
+        // No Windows Settings pairing step is required. Protected ATT operations authenticate on demand.
+        public ulong Connect(ulong address,bool automaticReconnect=false,ConnectionFeatures features=ConnectionFeatures.Default,bool authenticate=true)
+        {
+            var options=new ConnectOptions {StructSize=(uint)sizeof(ConnectOptions),Features=(uint)features,Authentication=authenticate?0u:1u};
+            return Submit(new Command {Operation=Operation.Connect,Address=address,Flags=automaticReconnect?2u:0u,Data=(byte*)&options,DataLength=(uint)sizeof(ConnectOptions)});
+        }
+        public static bool TryGetConnectionState(Event e,NativeArray<byte> payload,int length,out ConnectionState state)
+        {
+            state=default;if(e.Type!=16||length!=sizeof(ConnectionState)||payload.Length<length)return false;
+            state=*(ConnectionState*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(payload);return true;
+        }
         public ulong Start(ulong device,Measurement type)=>Submit(new Command { Operation=Operation.StreamStart,Device=device,Measurement=type });
         public void Cancel(ulong request) { ThrowIfDisposed();Check(Api.polar_sdk_cancel(handle,request)); }
         public PolarStream AttachStream(ulong stream,int capacity=4096) { ThrowIfDisposed();for(int i=0;i<streams.Count;i++)if(streams[i].Handle==stream)return streams[i];var result=new PolarStream(stream,capacity);streams.Add(result);return result; }

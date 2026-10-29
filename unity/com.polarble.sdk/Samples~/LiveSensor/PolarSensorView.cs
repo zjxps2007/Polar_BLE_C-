@@ -7,6 +7,7 @@ public class PolarSensorView : MonoBehaviour
     public Transform ControlledObject;
     public LineRenderer Graph;
     public bool Replay=true;
+    public ConnectionPhase ConnectionPhase { get; private set; }
     PolarContext context;
     PolarStream stream;
     ulong connectRequest,startRequest;
@@ -15,11 +16,12 @@ public class PolarSensorView : MonoBehaviour
     {
         context=new PolarContext();context.EventReceived+=OnEvent;
         if(Replay)startRequest=context.Submit(new Command {Operation=Operation.ReplayOpen,Measurement=Measurement.Acc,Flags=257});
-        else connectRequest=context.Connect(System.Convert.ToUInt64(BluetoothAddress,16),true);
+        else connectRequest=context.Connect(System.Convert.ToUInt64(BluetoothAddress,16),true,ConnectionFeatures.Default|ConnectionFeatures.Streaming);
         if(Graph) {Graph.positionCount=points.Length;for(int i=0;i<points.Length;i++)points[i].x=i*.02f;}
     }
     void OnEvent(Polar.Native.Event e,NativeArray<byte> payload,int count)
     {
+        if(PolarContext.TryGetConnectionState(e,payload,count,out var state))ConnectionPhase=state.Phase;
         if(e.Type==11&&e.Result==0)startRequest=context.Start(e.Device,Measurement.Acc);
         if(e.Type==1&&e.Result==0)
         {

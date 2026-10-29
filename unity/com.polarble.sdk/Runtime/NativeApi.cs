@@ -2,9 +2,15 @@ using System;
 using System.Runtime.InteropServices;
 namespace Polar.Native
 {
-    public enum Operation : uint { ScanStart=1, ScanStop=2, Connect=3, Disconnect=4, PairState=5, Pair=6, Services=7, Radio=8, Read=9, Write=10, Subscribe=11, AutoConnect=12, ReconnectPolicy=13, Initialize=14, DeviceInfo=15, Capabilities=16, PmdFeatures=20, PmdSettings=21, StreamStart=22, StreamStop=23, PmdCommand=24, FileGet=30, FilePut=31, FileRemove=32, FileList=33, Query=34, Notification=35, Features=40, Telemetry=41, Service=50, ReplayOpen=100, ReplayClose=101 }
+    public enum Operation : uint { ScanStart=1, ScanStop=2, Connect=3, Disconnect=4, PairState=5, Pair=6, Services=7, Radio=8, Read=9, Write=10, Subscribe=11, AutoConnect=12, ReconnectPolicy=13, Initialize=14, DeviceInfo=15, Capabilities=16, Unpair=17, PmdFeatures=20, PmdSettings=21, StreamStart=22, StreamStop=23, PmdCommand=24, FileGet=30, FilePut=31, FileRemove=32, FileList=33, Query=34, Notification=35, Features=40, Telemetry=41, Service=50, ReplayOpen=100, ReplayClose=101 }
     public enum Measurement : uint { Ecg=0, Ppg=1, Acc=2, Ppi=3, Gyroscope=5, Magnetometer=6, SkinTemperature=7, Location=10, Pressure=11, Temperature=12, OfflineHeartRate=14, Derived=15, HeartRate=64, Thermometer=65, BatteryLevel=66, BatteryStatus=67, HrAdvertisement=68 }
     public enum OverflowPolicy : uint { Latest=0, Lossless=1 }
+    [Flags] public enum ConnectionFeatures : uint { None=0, HeartRate=1, DeviceInformation=2, Battery=4, Streaming=8, Default=7 }
+    public enum ConnectionPhase : uint { Connecting=1, Discovering=2, Negotiating=3, Initializing=4, Authenticating=5, Ready=6, Failed=7 }
+    [StructLayout(LayoutKind.Sequential,Pack=8)]
+    public struct ConnectionState { public ConnectionPhase Phase; public ConnectionFeatures Requested,Ready,Unavailable,Failed; public uint MaxPduSize,PairingStatus,AuthenticationAttempts; }
+    [StructLayout(LayoutKind.Sequential,Pack=8)]
+    internal struct ConnectOptions { public uint StructSize,Features,Authentication,Reserved; }
     [StructLayout(LayoutKind.Sequential,Pack=8)]
     public struct Progress {public ulong TransferredBytes,TotalBytes;public uint PathLength,Direction;}
     [StructLayout(LayoutKind.Sequential,Pack=8)]

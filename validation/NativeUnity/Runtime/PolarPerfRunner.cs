@@ -30,6 +30,7 @@ namespace PolarValidation
         }
         void Start()
         {
+            if(Argument("--polar-live","")!="") { finished=true;gameObject.AddComponent<PolarLiveRunner>();Destroy(this);return; }
             began=Time.realtimeSinceStartupAsDouble; last=began;
             try
             {

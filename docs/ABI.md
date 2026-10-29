@@ -25,10 +25,11 @@ The ABI uses Windows x64 default 8-byte packing and C `__cdecl` exports. Every s
 | Operation | Input / output |
 |---|---|
 | SCAN_START / STOP | flags bit0 includes non-Polar advertisements. ADVERTISEMENT payload is `polar_advertisement`. |
-| CONNECT | `address`; bit0 uses cached GATT, bit1 enables reconnect. Completion: uint32 usable ATT payload, uint32 paired, then 16-byte Windows GUIDs. |
-| AUTO_CONNECT | optional `data`: int32 minimum RSSI + uint32 settle milliseconds; `path`: name prefix. Chooses strongest matching Polar advertisement. |
+| CONNECT | `address`; bit0 uses cached GATT, bit1 enables reconnect. Optional 16-byte `polar_connect_options` in data selects feature mask and authentication policy. Empty data prepares HR/DIS/BAS (mask 7). Completion follows initialization: uint32 usable ATT payload, uint32 paired, then 16-byte Windows GUIDs. |
+| AUTO_CONNECT | optional `data`: int32 minimum RSSI + uint32 settle milliseconds, optionally followed by `polar_connect_options`; `path`: name prefix. Chooses strongest matching Polar advertisement, then uses the same initialization flow. |
 | RECONNECT_POLICY | `device`, flags 0/1. Disabling also cancels queued retries for that session. |
-| PAIR_STATE / PAIR | `address`; read state / request Windows pairing. No forced unpair. |
+| PAIR_STATE / PAIR | `address`; read state / explicitly request Windows pairing. Normal CONNECT does not require pre-pairing. |
+| UNPAIR (17) | `address`; explicit Windows bond recovery. Invalidates this context's target device/streams, cancels queued reconnects, returns uint32 DeviceUnpairingResultStatus. Never invoked automatically by CONNECT. |
 | RADIO | flags 0 snapshot, 1 observe, 2 stop observing. Snapshot uint32: 0 unknown, 1 on, 2 off, 3 disabled, 4 no Bluetooth radio. RADIO events carry Windows RadioState 0..3 in flags and payload. |
 | SERVICES | `device`; returned GUIDs use Windows in-memory GUID layout, 16 bytes each. |
 | READ / WRITE / SUBSCRIBE | `device`, service/characteristic GUIDs; WRITE bit0 with response; SUBSCRIBE bit0 enabled. |
@@ -63,7 +64,13 @@ The C API synchronizes native state, but the application must not free caller bu
 
 ## Native initialization and observers
 
-`INITIALIZE` selects requested feature IDs as bits (zero = all 22 native features). It prepares the required native GATT clients and returns `polar.sdk.DeviceSnapshot` with per-feature ready/unavailable/failed state plus result/HRESULT/ATT fields. `CAPABILITIES` returns the cached snapshot; `DEVICE_INFO` refreshes DIS bytes. Explicit initialization replaces mobile constructor callback setup. HR/HTS/BAS data still uses explicit stream start and batched reads. A ready transport does not guarantee that every later Polar file/command exists.
+`CONNECT` prepares the selected features before its completion. `polar_connect_options` has four uint32 fields: struct_size=16, feature_mask, authentication (0 on demand, 1 disabled), reserved=0. A zero feature mask explicitly requests transport only. ACC callers can request mask 15 (HR/DIS/BAS/PMD). Missing services are reported as unavailable; a failed requested feature fails CONNECT. STREAM_START also prepares its required feature if it is not ready yet.
+
+`CONNECTION_STATE` (16) carries the 32-byte `polar_connection_state`: connecting, discovering, negotiating, initializing, authenticating, ready or failed; requested/ready/unavailable/failed masks; MaxPduSize; Windows pairing status (UINT32_MAX before an attempt); authentication attempt count. The event's device handle is provisional until successful CONNECT completion or RECONNECTED. READY proves feature preparation, not receipt of live samples. State payloads are binary even when result is negative. DIAGNOSTIC stages 60..67 identify the client being prepared.
+
+`INITIALIZE` explicitly adds/refreshes features (flags=0 selects all 22) and returns `polar.sdk.DeviceSnapshot` with per-feature ready/unavailable/failed state plus result/HRESULT/ATT fields. `CAPABILITIES` returns the cached snapshot; `DEVICE_INFO` refreshes DIS bytes. HR/HTS/BAS data still uses explicit stream start and batched reads. A ready transport does not guarantee that every later Polar file/command exists.
+
+Protected read/write/CCCD operations handle ATT 0x05/0x0F through one native authentication policy. The same GATT session and operation are retained; there are at most two authentication recovery stages. Idempotent reads/CCCD writes may retry every 500 ms for up to 12 seconds while Windows encryption is settling (bounded by a shorter command timeout). Arbitrary writes with an uncertain Unreachable outcome are not replayed. Cancel/disconnect checks reject late completions. `AUTHENTICATION_FAILED=-13` ends the request and disables automatic reconnect for that failed session. Windows owns MTU/PHY; optional Windows 11 balanced connection preferences and negotiation events are used without raising the Windows 10 minimum. Reconnects preserve feature/authentication options and back off 2/4/8/16 seconds. The public WinRT disconnect event does not expose HCI key-error codes; the SDK does not invent them from a generic disconnect.
 
 SCAN_START flags bit2 returns an HR advertisement stream, bit1 suppresses identical manufacturer payloads, and data optionally supplies a uint64 BLE-address list. `sample.identifier` contains the exact advertisement address. SCAN_STOP stops the broadcast stream; drain and release it normally. These scan flags do not alter sensor sampling.
 

@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "connection_policy.hpp"
 #include "services.hpp"
 #include <winrt/base.h>
 #include <cmath>
@@ -331,7 +332,8 @@ void context::control() {
             e.e.device = c->reconnect_from;
             push(std::move(e));
             std::lock_guard l(gate);
-            c->ready_at = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            c->ready_at = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(reconnect_delay_ms(++c->reconnect_failures));
             commands.push_back(c);
             continue;
         }
@@ -346,7 +348,7 @@ void context::control() {
     ble->shutdown();
     winrt::uninit_apartment();
 }
-void context::reconnect(uint64_t previous, uint64_t address) {
+void context::reconnect(uint64_t previous, uint64_t address, view options) {
     auto c = std::make_shared<command>();
     c->id = next_handle();
     c->reconnect_from = previous;
@@ -354,6 +356,7 @@ void context::reconnect(uint64_t previous, uint64_t address) {
     c->c.address = address;
     c->c.flags = 2;
     c->c.timeout_ms = config.command_timeout_ms;
+    c->data.assign(options.begin(), options.end());
     {
         std::lock_guard l(gate);
         if (stopping)
@@ -560,6 +563,10 @@ polar_result POLAR_CALL polar_sdk_submit(polar_context id, const polar_command *
                 (input->operation == POLAR_OP_RECONNECT_POLICY && input->flags == 0))
                 for (auto &[rid, request] : c->requests)
                     if (request->reconnect_from == input->device)
+                        request->abort();
+            if (input->operation == POLAR_OP_UNPAIR)
+                for (auto &[rid, request] : c->requests)
+                    if (request->reconnect_from && request->c.address == input->address)
                         request->abort();
             c->requests.emplace(q->id, q);
             c->commands.push_back(q);
