@@ -1,0 +1,11 @@
+syntax = "proto2";
+option csharp_namespace = "PolarBle.Protocol.Protobuf";
+
+package data;
+
+option java_package = "fi.polar.remote.representation.protobuf";
+option java_outer_classname = "ExerciseRRSamples";
+
+message PbExerciseRRIntervals {
+  repeated uint32 rr_intervals = 1 [packed = true];
+};

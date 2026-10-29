@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <AssemblyName>Polar.Windows</AssemblyName>
+    <RootNamespace>PolarBle.Windows</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <CsWinRTAotOptimizerEnabled>Auto</CsWinRTAotOptimizerEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Polar.Core/Polar.Core.csproj" />
+    <Compile Remove="Verification/**/*.cs" />
+  </ItemGroup>
+</Project>

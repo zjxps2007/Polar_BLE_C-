@@ -1,0 +1,9 @@
+{
+  "name": "com.polarble.sdk",
+  "version": "0.1.0",
+  "displayName": "Polar BLE C# Windows Port (Experimental)",
+  "description": "Unofficial C# port of Polar BLE protocols for Windows and Unity. See implementation status and the Polar SDK license.",
+  "unity": "6000.0",
+  "author": { "name": "Local development" },
+  "samples": [{ "displayName": "Heart Rate", "description": "Windows BLE scan/connect and main-thread heart rate events.", "path": "Samples~/HeartRate" }]
+}

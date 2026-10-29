@@ -1,0 +1,10 @@
+{
+  "name": "PolarBle.Unity",
+  "rootNamespace": "PolarBle.Unity",
+  "includePlatforms": [
+    "Editor",
+    "WindowsStandalone64"
+  ],
+  "allowUnsafeCode": false,
+  "autoReferenced": true
+}

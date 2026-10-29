@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.dll binary
+*.tgz binary
+
+# Preserve upstream notices and Unity-generated metadata without whitespace edits.
+LICENSES/** -whitespace
+proto/** -whitespace
+unity/com.polarble.sdk/Licenses~/** -whitespace
+unity/com.polarble.sdk/LICENSE.md -whitespace
+*.meta -whitespace

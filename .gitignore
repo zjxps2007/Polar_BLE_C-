@@ -1,0 +1,7 @@
+.tools/
+.nuget/
+**/bin/
+**/obj/
+artifacts/
+upstream/
+.vs/

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <AssemblyName>Polar.Native</AssemblyName>
+    <RootNamespace>PolarBle.Native</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <CsWinRTAotOptimizerEnabled>Auto</CsWinRTAotOptimizerEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Polar.Windows/Polar.Windows.csproj" />
+  </ItemGroup>
+</Project>
